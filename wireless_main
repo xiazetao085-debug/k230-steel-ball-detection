@@ -1,0 +1,472 @@
+# -*- coding: utf-8 -*-
+"""K230D offline RTSP camera server.
+
+The board creates its own Wi-Fi AP, so no Internet connection is required.
+Copy this file to the K230D SD card as ``main.py`` and power on the board.
+Connect the computer to the AP, then open the printed RTSP URL with VLC.
+"""
+
+import os
+import sys
+import time
+import uctypes
+import _thread
+import network
+import multimedia as mm
+
+from media.media import MediaManager
+from media.sensor import CAM_CHN_ID_1, Sensor
+from media.vencoder import (
+    ChnAttrStr,
+    Encoder,
+    StreamData,
+    VENC_DEV_ID,
+    VIDEO_ENCODE_MOD_ID,
+)
+
+
+AP_SSID = "K230D_BALL"
+AP_KEY = "12345678"
+
+SOURCE_WIDTH = 1920
+SOURCE_HEIGHT = 1080
+SOURCE_FPS = 30
+VIDEO_WIDTH = 800
+VIDEO_HEIGHT = 480
+VIDEO_FPS = 15
+VIDEO_BIT_RATE = 1000
+VIDEO_GOP = VIDEO_FPS * 2
+VIDEO_CHANNEL = CAM_CHN_ID_1
+RTSP_PORT = 8554
+RTSP_SESSION = "test"
+AP_DEVICE_NAME = "w1"
+NETWORK_TIMEOUT = 15
+NETWORK_START_RETRIES = 3
+NETWORK_RETRY_DELAY_MS = 1000
+GET_STREAM_TIMEOUT_MS = 1000
+THREAD_STOP_TIMEOUT_MS = 2000
+
+
+def wait_for_ip(ap, timeout=NETWORK_TIMEOUT):
+    """Wait until the AP interface owns a usable IPv4 address."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        config = ap.ifconfig()
+        if config and config[0] != "0.0.0.0":
+            return config[0]
+        os.exitpoint()
+        time.sleep_ms(200)
+    raise RuntimeError("Wi-Fi AP did not obtain an IP address")
+
+
+def require_ap_network_device():
+    """Verify the BL616 AP network device used by Lite-K230D."""
+    if not hasattr(network, "get_dev_list"):
+        raise RuntimeError(
+            "Network device discovery is not supported by this firmware")
+    devices = network.get_dev_list()
+    if devices is None or AP_DEVICE_NAME not in devices:
+        raise RuntimeError(
+            "Wi-Fi AP device '%s' is unavailable: %s"
+            % (AP_DEVICE_NAME, devices)
+        )
+
+
+def stop_wifi_ap(ap):
+    """Stop the AP; active(False) is a no-op on the proven firmware."""
+    if ap is None:
+        return
+    try:
+        if hasattr(ap, "stop"):
+            ap.stop()
+    except BaseException as error:
+        print("Wi-Fi AP stop warning:", error)
+
+
+def start_wifi_ap():
+    """Start an offline Wi-Fi AP and return ``(ap, ip_address)``."""
+    if not hasattr(network, "WLAN"):
+        raise RuntimeError("Wi-Fi is not supported by this firmware")
+
+    require_ap_network_device()
+    ap = None
+    try:
+        ap = network.WLAN(network.AP_IF)
+        print("Starting Wi-Fi access point:", AP_SSID)
+
+        result = ap.config(ssid=AP_SSID, key=AP_KEY)
+        if result is False:
+            print("AP start returned False; resetting AP once")
+            stop_wifi_ap(ap)
+            time.sleep_ms(300)
+            if ap.config(ssid=AP_SSID, key=AP_KEY) is False:
+                raise RuntimeError("Failed to start Wi-Fi access point")
+
+        ip_address = wait_for_ip(ap)
+        if not hasattr(network, "set_default_dev"):
+            raise RuntimeError(
+                "Default network selection is unsupported by this firmware")
+        if network.set_default_dev(AP_DEVICE_NAME) is False:
+            raise RuntimeError(
+                "Failed to select network device '%s'" % AP_DEVICE_NAME)
+
+        print("Wi-Fi AP SSID:", AP_SSID)
+        print("Wi-Fi AP key:", AP_KEY)
+        print("Wi-Fi AP config:", ap.ifconfig())
+        print("Default network device:", AP_DEVICE_NAME)
+        print("RTSP URL: rtsp://%s:%d/%s" %
+              (ip_address, RTSP_PORT, RTSP_SESSION))
+        return ap, ip_address
+    except BaseException:
+        stop_wifi_ap(ap)
+        raise
+
+
+def start_wifi_ap_with_retries():
+    """Recover from occasional BL616/hostapd cold-start delays."""
+    last_error = None
+    for attempt in range(1, NETWORK_START_RETRIES + 1):
+        try:
+            return start_wifi_ap()
+        except BaseException as error:
+            last_error = error
+            print(
+                "Wi-Fi AP attempt %d/%d failed: %s"
+                % (attempt, NETWORK_START_RETRIES, error)
+            )
+            if attempt < NETWORK_START_RETRIES:
+                os.exitpoint()
+                time.sleep_ms(NETWORK_RETRY_DELAY_MS)
+    raise RuntimeError(
+        "Wi-Fi AP failed after %d attempts: %s"
+        % (NETWORK_START_RETRIES, last_error)
+    )
+
+
+class RtspServer:
+    def __init__(self, session_name=RTSP_SESSION, port=RTSP_PORT,
+                 video_type=mm.multi_media_type.media_h264,
+                 enable_audio=False):
+        self.session_name = session_name
+        self.port = port
+        self.video_type = video_type
+        self.enable_audio = enable_audio
+
+        self.rtspserver = mm.rtsp_server()
+        self.sensor = None
+        self.encoder = None
+        self.link = None
+
+        self.start_stream = False
+        self.runthread_over = True
+        self._thread_running = False
+        self._rtsp_initialized = False
+        self._rtsp_session_created = False
+        self._rtsp_started = False
+        self._sensor_started = False
+        self._encoder_started = False
+        self._encoder_created = False
+        self._thread_error = None
+
+    def start(self):
+        """Initialize the camera and start the RTSP sending thread."""
+        if self.start_stream:
+            return
+
+        try:
+            self._init_stream()
+
+            result = self.rtspserver.rtspserver_init(self.port)
+            if result != 0:
+                raise RuntimeError(
+                    "RTSP server failed to bind port %d" % self.port)
+            self._rtsp_initialized = True
+            result = self.rtspserver.rtspserver_createsession(
+                self.session_name, self.video_type, self.enable_audio)
+            if result != 0:
+                raise RuntimeError("RTSP session creation failed")
+            self._rtsp_session_created = True
+
+            self.rtspserver.rtspserver_start()
+            self._rtsp_started = True
+
+            self._start_stream()
+            self._thread_error = None
+            self.start_stream = True
+            self.runthread_over = False
+            self._thread_running = True
+            try:
+                _thread.start_new_thread(self._do_rtsp_stream, ())
+            except BaseException:
+                self.start_stream = False
+                self.runthread_over = True
+                self._thread_running = False
+                raise
+        except BaseException:
+            self.start_stream = False
+            self._thread_running = False
+            self.runthread_over = True
+            self._cleanup()
+            raise
+
+    def stop(self):
+        """Stop streaming and release all camera/encoder/RTSP resources."""
+        self.start_stream = False
+
+        wait_started = time.time()
+        while (
+            self._thread_running
+            and not self.runthread_over
+            and time.time() - wait_started
+            < THREAD_STOP_TIMEOUT_MS / 1000.0
+        ):
+            time.sleep_ms(10)
+
+        # A timed GetStream normally lets the thread exit. If it did not,
+        # stop the sensor once to unblock the pending frame read.
+        if self._thread_running and not self.runthread_over:
+            print("RTSP thread stop timeout; stopping sensor to unblock it")
+            if self._sensor_started and self.sensor is not None:
+                try:
+                    self.sensor.stop()
+                except BaseException as error:
+                    print("Sensor cleanup warning:", error)
+                self._sensor_started = False
+
+            wait_started = time.time()
+            while (
+                self._thread_running
+                and not self.runthread_over
+                and time.time() - wait_started < 1.0
+            ):
+                time.sleep_ms(10)
+
+        if self._thread_running and not self.runthread_over:
+            print("RTSP thread still blocked; forcing server/encoder stop")
+            try:
+                if self._rtsp_started:
+                    self.rtspserver.rtspserver_stop()
+                    self._rtsp_started = False
+            except BaseException as error:
+                print("RTSP forced-stop warning:", error)
+            try:
+                if self._encoder_started and self.encoder is not None:
+                    self.encoder.Stop()
+                    self._encoder_started = False
+            except BaseException as error:
+                print("VENC forced-stop warning:", error)
+
+            wait_started = time.time()
+            while (
+                self._thread_running
+                and not self.runthread_over
+                and time.time() - wait_started < 1.0
+            ):
+                time.sleep_ms(10)
+
+        if self._thread_running and not self.runthread_over:
+            print("RTSP thread did not exit; unsafe resource destroy skipped")
+            return False
+
+        self._thread_running = False
+        self.runthread_over = True
+        self._cleanup()
+        return True
+
+    def get_rtsp_url(self, ip_address):
+        return "rtsp://%s:%d/%s" % (
+            ip_address, self.port, self.session_name)
+
+    def _init_stream(self):
+        width = VIDEO_WIDTH
+        height = VIDEO_HEIGHT
+
+        self.sensor = Sensor(
+            width=SOURCE_WIDTH,
+            height=SOURCE_HEIGHT,
+            fps=SOURCE_FPS,
+        )
+        self.sensor.reset()
+        self.sensor.set_framesize(
+            width=width,
+            height=height,
+            alignment=12,
+            chn=VIDEO_CHANNEL,
+        )
+        self.sensor.set_pixformat(
+            Sensor.YUV420SP,
+            chn=VIDEO_CHANNEL,
+        )
+
+        self.encoder = Encoder()
+        self.encoder.SetOutBufs(8, width, height)
+        try:
+            channel_attr = ChnAttrStr(
+                self.encoder.PAYLOAD_TYPE_H264,
+                self.encoder.H264_PROFILE_MAIN,
+                width,
+                height,
+                bit_rate=VIDEO_BIT_RATE,
+                gopLen=VIDEO_GOP,
+                src_frame_rate=VIDEO_FPS,
+                dst_frame_rate=VIDEO_FPS,
+            )
+        except TypeError:
+            channel_attr = ChnAttrStr(
+                self.encoder.PAYLOAD_TYPE_H264,
+                self.encoder.H264_PROFILE_MAIN,
+                width,
+                height,
+                bit_rate=VIDEO_BIT_RATE,
+                gopLen=VIDEO_GOP,
+            )
+        self.encoder.Create(channel_attr)
+        self._encoder_created = True
+
+        self.link = MediaManager.link(
+            self.sensor.bind_info(
+                x=0,
+                y=0,
+                chn=VIDEO_CHANNEL,
+            )["src"],
+            (
+                VIDEO_ENCODE_MOD_ID,
+                VENC_DEV_ID,
+                self.encoder.chn,
+            ),
+        )
+
+    def _start_stream(self):
+        self.encoder.Start()
+        self._encoder_started = True
+        self.sensor.run()
+        self._sensor_started = True
+
+    def _cleanup(self):
+        if self._sensor_started and self.sensor is not None:
+            try:
+                self.sensor.stop()
+            except BaseException:
+                pass
+            self._sensor_started = False
+
+        if self.link is not None:
+            try:
+                self.link.destroy()
+            except BaseException:
+                pass
+            self.link = None
+
+        if self._encoder_started and self.encoder is not None:
+            try:
+                self.encoder.Stop()
+            except BaseException:
+                pass
+            self._encoder_started = False
+
+        if self._encoder_created and self.encoder is not None:
+            try:
+                self.encoder.Destroy()
+            except BaseException:
+                pass
+            self._encoder_created = False
+        self.encoder = None
+
+        if self._rtsp_started:
+            try:
+                self.rtspserver.rtspserver_stop()
+            except BaseException:
+                pass
+            self._rtsp_started = False
+
+        if self._rtsp_session_created:
+            try:
+                self.rtspserver.rtspserver_destroysession(
+                    self.session_name)
+            except BaseException:
+                pass
+            self._rtsp_session_created = False
+
+        if self._rtsp_initialized:
+            try:
+                self.rtspserver.rtspserver_deinit()
+            except BaseException:
+                pass
+            self._rtsp_initialized = False
+
+        self.sensor = None
+
+    def _do_rtsp_stream(self):
+        stream_data = StreamData()
+        consecutive_get_failures = 0
+        try:
+            while self.start_stream:
+                os.exitpoint()
+                get_result = self.encoder.GetStream(
+                    stream_data,
+                    timeout=GET_STREAM_TIMEOUT_MS,
+                )
+                if get_result not in (None, 0):
+                    consecutive_get_failures += 1
+                    if consecutive_get_failures >= 5:
+                        raise RuntimeError(
+                            "VENC produced no stream for 5 consecutive reads")
+                    continue
+                consecutive_get_failures = 0
+
+                try:
+                    for pack_idx in range(stream_data.pack_cnt):
+                        data_size = stream_data.data_size[pack_idx]
+                        data = bytes(uctypes.bytearray_at(
+                            stream_data.data[pack_idx], data_size))
+                        send_result = self.rtspserver.rtspserver_sendvideodata(
+                            self.session_name, data, data_size, 1000)
+                        if send_result not in (None, 0):
+                            raise RuntimeError(
+                                "RTSP video send failed: %s" % send_result)
+                finally:
+                    self.encoder.ReleaseStream(stream_data)
+        except BaseException as error:
+            self._thread_error = error
+            sys.print_exception(error)
+        finally:
+            self.start_stream = False
+            self.runthread_over = True
+            self._thread_running = False
+
+
+def main():
+    """Program entry point for offline operation on K230D."""
+    ap = None
+    rtsp_server = None
+
+    try:
+        os.exitpoint(os.EXITPOINT_ENABLE)
+        ap, ip_address = start_wifi_ap_with_retries()
+
+        rtsp_server = RtspServer()
+        rtsp_server.start()
+        print("RTSP server started:", rtsp_server.get_rtsp_url(ip_address))
+        print("Press Ctrl-C to stop.")
+
+        while rtsp_server.start_stream:
+            time.sleep(1)
+
+        if rtsp_server._thread_error is not None:
+            raise RuntimeError(
+                "RTSP stream thread failed: %s"
+                % rtsp_server._thread_error)
+
+    except KeyboardInterrupt:
+        print("User stopped.")
+    except BaseException as error:
+        sys.print_exception(error)
+    finally:
+        if rtsp_server is not None:
+            rtsp_server.stop()
+        stop_wifi_ap(ap)
+        print("RTSP server stopped.")
+
+
+if __name__ == "__main__":
+    main()
